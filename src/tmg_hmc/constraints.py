@@ -366,6 +366,7 @@ class BaseQuadraticConstraint(Constraint):
         """
         self.A_orig = A
         self.S = S
+        self._A_cached = S @ A @ S
         self.value = self.value_
         self.normal = self.normal_
         self.compute_q = self.compute_q_
@@ -390,7 +391,6 @@ class BaseQuadraticConstraint(Constraint):
         self.n_comps = len(rows)
         self.n = A.shape[0]
         self.A_orig = A
-        print(S)
         self.s_rows = [S[i,:].reshape((1,self.n)) for i in rows] # S[i,:] is a row vector
         self.s_cols = [S[:,j].reshape((self.n,1)) for j in cols] # S[:,j] is a column vector
         self.a_vals = vals.reshape((self.n_comps,))
@@ -422,10 +422,10 @@ class BaseQuadraticConstraint(Constraint):
         """Placeholder method for sparse q term computation"""
         pass
 
-    @property 
+    @property
     def A(self):
-        """Compute the transformed quadratic matrix A = S A_orig S on the fly"""
-        return self.S @ self.A_orig @ self.S
+        """Return the cached transformed quadratic matrix A = S A_orig S"""
+        return self._A_cached
     
     def A_dot_x(self, x: Array) -> Array:
         """
@@ -610,9 +610,9 @@ class SimpleQuadraticConstraint(BaseQuadraticConstraint):
         These expressions are the nonzero q terms defined in equation 2.45 in Pakman and Paninski (2014)
         """
         A = self.A
-        c = self.c
-        q1 = to_scalar(b.T @ A @ b - a.T @ A @ a)
-        q3 = c + to_scalar(a.T @ A @ a)
+        aAa = to_scalar(a.T @ A @ a)
+        q1 = to_scalar(b.T @ A @ b) - aAa
+        q3 = self.c + aAa
         q4 = to_scalar(2 * a.T @ A @ b)
         return q1, q3, q4
     
@@ -636,8 +636,9 @@ class SimpleQuadraticConstraint(BaseQuadraticConstraint):
         -----
         These expressions are the nonzero q terms defined in equation 2.45 in Pakman and Paninski (2014)
         """
-        q1 = to_scalar(self.x_dot_A_dot_x(b) - self.x_dot_A_dot_x(a))
-        q3 = self.c + to_scalar(self.x_dot_A_dot_x(a))
+        aAa = to_scalar(self.x_dot_A_dot_x(a))
+        q1 = to_scalar(self.x_dot_A_dot_x(b)) - aAa
+        q3 = self.c + aAa
         q4 = to_scalar(2 * a.T @ self.A_dot_x(b))
         return q1, q3, q4
     
@@ -710,7 +711,7 @@ class QuadraticConstraint(BaseQuadraticConstraint):
         self.b = b
         if isinstance(A, Sparse):
             sparse = True
-        self.sparse = sparse or compiled
+        self.sparse = sparse
         self.compiled = compiled
 
         if self.sparse:
@@ -842,13 +843,12 @@ class QuadraticConstraint(BaseQuadraticConstraint):
         These expressions are defined in Eqns 2.40-2.44 in Pakman and Paninski (2014)
         """
         A = self.A
-        B = self.b
-        c = self.c
-        q1 = to_scalar(b.T @ A @ b - a.T @ A @ a)
-        q2 = to_scalar(B.T @ b)
-        q3 = c + to_scalar(a.T @ A @ a)
+        aAa = to_scalar(a.T @ A @ a)
+        q1 = to_scalar(b.T @ A @ b) - aAa
+        q2 = to_scalar(self.b.T @ b)
+        q3 = self.c + aAa
         q4 = to_scalar(2 * a.T @ A @ b)
-        q5 = to_scalar(B.T @ a)
+        q5 = to_scalar(self.b.T @ a)
         return q1, q2, q3, q4, q5
     
     def compute_q_sparse(self, a: Array, b: Array) -> Tuple[float, float, float, float, float]:
@@ -871,13 +871,12 @@ class QuadraticConstraint(BaseQuadraticConstraint):
         -----
         These expressions are defined in Eqns 2.40-2.44 in Pakman and Paninski (2014)
         """
-        B = self.b
-        c = self.c
-        q1 = to_scalar(self.x_dot_A_dot_x(b) - self.x_dot_A_dot_x(a))
-        q2 = to_scalar(B.T @ b)
-        q3 = c + to_scalar(self.x_dot_A_dot_x(a))
+        aAa = to_scalar(self.x_dot_A_dot_x(a))
+        q1 = to_scalar(self.x_dot_A_dot_x(b)) - aAa
+        q2 = to_scalar(self.b.T @ b)
+        q3 = self.c + aAa
         q4 = to_scalar(2 * a.T @ self.A_dot_x(b))
-        q5 = to_scalar(B.T @ a)
+        q5 = to_scalar(self.b.T @ a)
         return q1, q2, q3, q4, q5
 
     def hit_time_cpp(self, x: Array, xdot: Array) -> Array:
