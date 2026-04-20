@@ -260,6 +260,78 @@ def test_add_linear_constraints_batch_sampling():
     assert np.all(satisfied)
 
 
+def test_hit_times_with_precomputed_q_values():
+    dim = 5
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    fs = np.random.randn(20, dim)
+    cs = np.zeros(20)
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+    sampler._rebuild_linear_index()
+
+    x = np.random.randn(dim, 1)
+    xdot = np.random.randn(dim, 1)
+
+    hs_baseline, cs_baseline = sampler._hit_times(x, xdot)
+
+    F = sampler._linear_F
+    q1 = F @ xdot.flatten()
+    q2 = F @ x.flatten()
+    hs_cached, cs_cached = sampler._hit_times(x, xdot, _q1=q1, _q2=q2)
+
+    assert np.allclose(hs_baseline, hs_cached)
+    assert len(cs_baseline) == len(cs_cached)
+    for c1, c2 in zip(cs_baseline, cs_cached):
+        if c1 is None:
+            assert c2 is None
+        else:
+            assert c1 is c2
+
+
+def test_q_value_propagation_identity():
+    dim = 5
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    fs = np.random.randn(20, dim)
+    cs = np.zeros(20)
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+    sampler._rebuild_linear_index()
+
+    F = sampler._linear_F
+    x = np.random.randn(dim, 1)
+    xdot = np.random.randn(dim, 1)
+
+    q1 = F @ xdot.flatten()
+    q2 = F @ x.flatten()
+
+    h = 0.7
+    x_new, xdot_new = sampler._propagate(x, xdot, h)
+
+    q2_direct = F @ x_new.flatten()
+    q1_direct = F @ xdot_new.flatten()
+
+    q2_cached = np.cos(h) * q2 + np.sin(h) * q1
+    q1_cached = np.cos(h) * q1 - np.sin(h) * q2
+
+    assert np.allclose(q2_direct, q2_cached)
+    assert np.allclose(q1_direct, q1_cached)
+
+
+def test_q_value_caching_sampling_correctness():
+    sampler = TMGSampler(Sigma=np.eye(3))
+    fs = np.array([[1.0, -1.0, 0.0],
+                   [-1.0, 1.0, 0.0],
+                   [0.0, 1.0, -1.0],
+                   [0.0, -1.0, 1.0]])
+    cs = np.array([0.5, 0.5, 0.5, 0.5])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    x0 = np.array([[0.0], [0.0], [0.0]])
+    samples = sampler.sample(x0=x0, n_samples=200, burn_in=20)
+
+    for i in range(len(fs)):
+        vals = samples @ fs[i] + cs[i]
+        assert np.all(vals >= -1e-10), f"Constraint {i} violated"
+
+
 def test_tight_constraints_end_to_end():
     sampler = TMGSampler(Sigma=np.eye(2))
     # x2 <= 1.1 x1 => x2 - 1.1 x1 >= 0

@@ -437,14 +437,17 @@ class TMGSampler:
         xdotnew = xdot * np.cos(t) - x * np.sin(t)
         return xnew, xdotnew
     
-    def _hit_times_linear(self, x: Array, xdot: Array) -> Tuple[Array, list]:
+    def _hit_times_linear(self, x: Array, xdot: Array, *, _q1=None, _q2=None) -> Tuple[Array, list]:
         F = self._linear_F
         c_vec = self._linear_c
-        x_flat = _to_numpy_flat(x)
-        xdot_flat = _to_numpy_flat(xdot)
 
-        q1 = F @ xdot_flat
-        q2 = F @ x_flat
+        if _q1 is not None and _q2 is not None:
+            q1, q2 = _q1, _q2
+        else:
+            x_flat = _to_numpy_flat(x)
+            xdot_flat = _to_numpy_flat(xdot)
+            q1 = F @ xdot_flat
+            q2 = F @ x_flat
         u = np.sqrt(q1**2 + q2**2)
 
         valid = (u >= np.abs(c_vec)) & (u > 0) & (q2 != 0)
@@ -475,7 +478,7 @@ class TMGSampler:
         constraints_out = [self._linear_constraints[i] for i in constraint_indices]
         return all_times_flat, constraints_out
 
-    def _hit_times(self, x: Array, xdot: Array) -> Tuple[Array, Array]:
+    def _hit_times(self, x: Array, xdot: Array, *, _q1=None, _q2=None) -> Tuple[Array, Array]:
         """
         Computes the hit times for all constraints given the current state (x, xdot).
         Returns sorted hit times and corresponding constraints.
@@ -499,7 +502,7 @@ class TMGSampler:
         cs = []
 
         if self._linear_F is not None:
-            lin_times, lin_cs = self._hit_times_linear(x, xdot)
+            lin_times, lin_cs = self._hit_times_linear(x, xdot, _q1=_q1, _q2=_q2)
             if len(lin_times) > 0:
                 times.append(lin_times)
                 cs.extend(lin_cs)
@@ -614,8 +617,14 @@ class TMGSampler:
         t = 0
         i = 0
         x_init = x
+        F = self._linear_F
 
-        hs, cs = self._hit_times(x, xdot)
+        if F is not None:
+            _q1 = F @ _to_numpy_flat(xdot)
+            _q2 = F @ _to_numpy_flat(x)
+        else:
+            _q1 = _q2 = None
+        hs, cs = self._hit_times(x, xdot, _q1=_q1, _q2=_q2)
         h, c = hs[0], cs[0]
         while h < self.T - t:
             i += 1
@@ -639,7 +648,12 @@ class TMGSampler:
             else:
                 break
 
-            hs, cs = self._hit_times(x, xdot)
+            if F is not None:
+                cos_h = np.cos(h)
+                sin_h = np.sin(h)
+                _q2 = cos_h * _q2 + sin_h * _q1
+                _q1 = F @ _to_numpy_flat(xdot)
+            hs, cs = self._hit_times(x, xdot, _q1=_q1, _q2=_q2)
             h, c = hs[0], cs[0]
 
         x, xdot = self._propagate(x, xdot, self.T - t)
