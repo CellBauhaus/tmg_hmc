@@ -1,7 +1,7 @@
 from __future__ import annotations
 import numpy as np
 from typing import Tuple
-from tmg_hmc.constraints import Constraint, LinearConstraint, SimpleQuadraticConstraint, QuadraticConstraint, ProductConstraint
+from tmg_hmc.constraints import Constraint, LinearConstraint, SimpleQuadraticConstraint, QuadraticConstraint, ProductConstraint, pis, eps
 from tmg_hmc.utils import Array, sparsify, is_nonzero_array
 import warnings
 import pickle
@@ -39,6 +39,10 @@ class TMGSampler:
         self.mu = mu.reshape(self.dim, 1)
         self.T = T
         self.constraints = []
+        self._linear_constraints = []
+        self._nonlinear_constraints = []
+        self._linear_F = None
+        self._linear_c = None
         self.constraint_violations = 0
         self.gpu = gpu
         self.x = None
@@ -251,6 +255,21 @@ class TMGSampler:
         """
         constraint = self._build_constraint(A=A, f=f, c=c, sparse=sparse, compiled=compiled)
         self.constraints.append(constraint)
+        self._index_constraint(constraint)
+
+    def _index_constraint(self, constraint: Constraint) -> None:
+        if isinstance(constraint, LinearConstraint):
+            self._linear_constraints.append(constraint)
+            f_row = np.asarray(constraint.f).flatten()
+            c_val = float(constraint.c)
+            if self._linear_F is None:
+                self._linear_F = f_row.reshape(1, -1)
+                self._linear_c = np.array([c_val])
+            else:
+                self._linear_F = np.vstack([self._linear_F, f_row.reshape(1, -1)])
+                self._linear_c = np.append(self._linear_c, c_val)
+        else:
+            self._nonlinear_constraints.append(constraint)
 
     def add_product_constraint(self, *, parameters: list[list[Array]] | list[dict[str,Array]], sparse: bool = True, compiled: bool = True) -> None:
         """
@@ -299,6 +318,7 @@ class TMGSampler:
             A, f, c = parse_param(parameters[0])
             constraint = self._build_constraint(A=A, f=f, c=c, sparse=sparse, compiled=compiled)
             self.constraints.append(constraint)
+            self._index_constraint(constraint)
             return
         cs = []
         for p in parameters:
@@ -307,7 +327,8 @@ class TMGSampler:
             cs.append(constraint)
         product_constraint = ProductConstraint(cs)
         self.constraints.append(product_constraint)
-            
+        self._index_constraint(product_constraint)
+
     def _constraints_satisfied(self, x: Array) -> bool:
         """
         Checks if all constraints are satisfied at point x.
@@ -324,7 +345,15 @@ class TMGSampler:
         """
         if len(self.constraints) == 0:
             return True
-        return all([c.is_satisfied(x) for c in self.constraints])
+        if self._linear_F is not None:
+            x_flat = np.asarray(x).flatten()
+            vals = self._linear_F @ x_flat + self._linear_c
+            if not np.all(vals >= 0):
+                return False
+        for c in self._nonlinear_constraints:
+            if not c.is_satisfied(x):
+                return False
+        return True
     
     def _propagate(self, x: Array, xdot: Array, t: float) -> Tuple[Array, Array]:
         """
@@ -349,6 +378,44 @@ class TMGSampler:
         xdotnew = xdot * np.cos(t) - x * np.sin(t)
         return xnew, xdotnew
     
+    def _hit_times_linear(self, x: Array, xdot: Array) -> Tuple[Array, list]:
+        F = self._linear_F
+        c_vec = self._linear_c
+        x_flat = np.asarray(x).flatten()
+        xdot_flat = np.asarray(xdot).flatten()
+
+        q1 = F @ xdot_flat
+        q2 = F @ x_flat
+        u = np.sqrt(q1**2 + q2**2)
+
+        valid = (u >= np.abs(c_vec)) & (u > 0) & (q2 != 0)
+        if not np.any(valid):
+            return np.array([]), []
+
+        q1_v = q1[valid]
+        q2_v = q2[valid]
+        c_v = c_vec[valid]
+        u_v = u[valid]
+        valid_indices = np.where(valid)[0]
+
+        arccos_term = np.arccos(-c_v / u_v)
+        arctan_term = np.arctan(q1_v / q2_v)
+
+        offsets = pis.reshape(1, -1)
+        s1 = (-arccos_term.reshape(-1, 1) + arctan_term.reshape(-1, 1) + offsets)
+        s2 = (arccos_term.reshape(-1, 1) + arctan_term.reshape(-1, 1) + offsets)
+        all_times = np.hstack([s1, s2])
+
+        constraint_indices = np.repeat(valid_indices, 6)
+        all_times_flat = all_times.flatten()
+
+        keep = all_times_flat > eps
+        all_times_flat = all_times_flat[keep]
+        constraint_indices = constraint_indices[keep]
+
+        constraints_out = [self._linear_constraints[i] for i in constraint_indices]
+        return all_times_flat, constraints_out
+
     def _hit_times(self, x: Array, xdot: Array) -> Tuple[Array, Array]:
         """
         Computes the hit times for all constraints given the current state (x, xdot).
@@ -368,12 +435,24 @@ class TMGSampler:
         """
         if len(self.constraints) == 0:
             return np.array([np.nan]), np.array([None])
+
         times = []
         cs = []
-        for c in self.constraints:
+
+        if self._linear_F is not None:
+            lin_times, lin_cs = self._hit_times_linear(x, xdot)
+            if len(lin_times) > 0:
+                times.append(lin_times)
+                cs.extend(lin_cs)
+
+        for c in self._nonlinear_constraints:
             t = c.hit_time(x, xdot)
             times.append(t)
             cs += [c] * len(t)
+
+        if len(times) == 0:
+            return np.array([np.nan]), np.array([None])
+
         times = np.hstack(times)
         nanind = np.isnan(times)
         times = times[~nanind]
@@ -592,6 +671,8 @@ class TMGSampler:
         Saves the sampler state to a pickled file.
         """
         d = self.__dict__.copy()
+        for key in ('_linear_constraints', '_nonlinear_constraints', '_linear_F', '_linear_c'):
+            d.pop(key, None)
         d['constraints'] = [c.serialize() for c in d['constraints']]
         if self.gpu:
             d['mu'] = d['mu'].cpu().numpy()
@@ -609,7 +690,9 @@ class TMGSampler:
             d = pickle.load(f)
         d['constraints'] = [Constraint.deserialize(c, d['gpu']) for c in d['constraints']]
         sampler = cls(mu=d['mu'], Sigma_half=d['Sigma_half'], T=d['T'], gpu=d['gpu'])
-        sampler.constraints = d['constraints']
+        for c in d['constraints']:
+            sampler.constraints.append(c)
+            sampler._index_constraint(c)
         if d['x'] is not None:
             if d['gpu']:
                 sampler.x = torch.tensor(d['x']).cuda()
