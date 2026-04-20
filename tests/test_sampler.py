@@ -332,6 +332,35 @@ def test_q_value_caching_sampling_correctness():
         assert np.all(vals >= -1e-10), f"Constraint {i} violated"
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not gpu_available, reason="GPU not available")
+def test_add_linear_constraints_batch_gpu_types():
+    dim = 3
+    sampler = TMGSampler(Sigma=np.eye(dim), gpu=True)
+    fs = np.array([[1.0, -1.0, 0.0], [0.0, 1.0, -1.0]])
+    cs = np.array([0.0, 0.0])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    for c in sampler._linear_constraints:
+        assert isinstance(c.f, torch.Tensor), "Batch-added constraint f should be a CUDA tensor in GPU mode"
+        assert c.f.is_cuda, "Batch-added constraint f should be on CUDA"
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not gpu_available, reason="GPU not available")
+def test_add_linear_constraints_batch_gpu_sampling():
+    sampler = TMGSampler(Sigma=np.eye(2), gpu=True)
+    fs = np.array([[1.1, -1.0], [-1.0, 1.0]])
+    cs = np.array([0.0, 0.0])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    x0 = np.array([[1.0], [1.05]])
+    samples = sampler.sample(x0=x0, n_samples=50, burn_in=10)
+    satisfied = samples[:, 1] <= 1.1 * samples[:, 0]
+    satisfied &= samples[:, 1] >= samples[:, 0]
+    assert np.all(satisfied)
+
+
 def test_tight_constraints_end_to_end():
     sampler = TMGSampler(Sigma=np.eye(2))
     # x2 <= 1.1 x1 => x2 - 1.1 x1 >= 0

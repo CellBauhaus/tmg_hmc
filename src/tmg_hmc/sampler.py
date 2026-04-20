@@ -302,6 +302,8 @@ class TMGSampler:
         for i in range(K):
             f_new = F_transformed[:, i].reshape(-1, 1)
             c_new = float(c_transformed[i])
+            if self.gpu:
+                f_new = torch.tensor(f_new).cuda()
             constraint = LinearConstraint(f_new, c_new)
             self.constraints.append(constraint)
             self._linear_constraints.append(constraint)

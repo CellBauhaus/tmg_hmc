@@ -391,6 +391,8 @@ class BaseQuadraticConstraint(Constraint):
         self.n_comps = len(rows)
         self.n = A.shape[0]
         self.A_orig = A
+        self.S = S
+        self._A_cached = S @ A @ S
         self.s_rows = [S[i,:].reshape((1,self.n)) for i in rows] # S[i,:] is a row vector
         self.s_cols = [S[:,j].reshape((self.n,1)) for j in cols] # S[:,j] is a column vector
         self.a_vals = vals.reshape((self.n_comps,))

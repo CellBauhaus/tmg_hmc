@@ -99,7 +99,8 @@ def test_quadratic_constraint_value_sparse(input_lists, c):
     assume(not np.allclose(f, np.zeros_like(f)))  # Ensure f is not the zero vector
     constraint = QuadraticConstraint(A=A, b=f, c=c, S=S, sparse=True)
     val = constraint.value(x)
-    Atilde = S @ A @ S # Note: do not test Atilde, not stored in sparse case
+    Atilde = S @ A @ S
+    assert np.allclose(constraint.A, Atilde)
     expected_val = x.T @ Atilde @ x + f.T @ x + c
     assert isinstance(val, float)
     assert np.isclose(val, expected_val)
@@ -117,7 +118,8 @@ def test_quadratic_constraint_value_sparse_gpu(input_lists, c):
     x = torch.tensor(x, device='cuda')
     constraint = QuadraticConstraint(A=A, b=f, c=c, S=S, sparse=True)
     val = constraint.value(x)
-    Atilde = S @ A @ S # Note: do not test Atilde, not stored in sparse case
+    Atilde = S @ A @ S
+    assert np.allclose(constraint.A.cpu().numpy(), Atilde.cpu().numpy())
     expected_val = x.T @ Atilde @ x + f.T @ x + c
     assert isinstance(val, float)
     assert np.isclose(val, expected_val.cpu().item())
