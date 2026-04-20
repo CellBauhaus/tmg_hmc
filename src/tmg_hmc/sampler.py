@@ -48,6 +48,9 @@ class TMGSampler:
         self._nonlinear_constraints = []
         self._linear_F = None
         self._linear_c = None
+        self._linear_F_rows = []
+        self._linear_c_vals = []
+        self._linear_index_dirty = False
         self.constraint_violations = 0
         self.gpu = gpu
         self.x = None
@@ -262,19 +265,70 @@ class TMGSampler:
         self.constraints.append(constraint)
         self._index_constraint(constraint)
 
+    def add_linear_constraints(self, *, fs: Array, cs: Array) -> None:
+        """
+        Batch-add linear constraints of the form f^T x + c >= 0.
+
+        Parameters
+        ----------
+        fs : Array, shape (K, N)
+            Each row is a constraint vector f.
+        cs : Array, shape (K,)
+            Constant terms.
+        """
+        fs = np.asarray(fs)
+        cs = np.asarray(cs).flatten()
+        K, N = fs.shape
+        if N != self.dim:
+            raise ValueError(f"fs has {N} columns but sampler dimension is {self.dim}")
+        if len(cs) != K:
+            raise ValueError(f"fs has {K} rows but cs has {len(cs)} elements")
+
+        S = self.Sigma_half
+        mu = self.mu
+
+        if self.gpu:
+            fs_col = torch.tensor(fs.T).cuda()
+            F_transformed = S @ fs_col
+            c_transformed = (mu.T @ fs_col).cpu().numpy().flatten() + cs
+            F_transformed = F_transformed.cpu().numpy()
+        else:
+            fs_col = fs.T
+            F_transformed = S @ fs_col
+            c_transformed = (mu.T @ fs_col).flatten() + cs
+            F_transformed = np.asarray(F_transformed)
+
+        F_rows = np.asarray(F_transformed.T)
+        for i in range(K):
+            f_new = F_transformed[:, i].reshape(-1, 1)
+            c_new = float(c_transformed[i])
+            constraint = LinearConstraint(f_new, c_new)
+            self.constraints.append(constraint)
+            self._linear_constraints.append(constraint)
+            self._linear_F_rows.append(F_rows[i])
+            self._linear_c_vals.append(c_new)
+
+        self._linear_index_dirty = True
+
     def _index_constraint(self, constraint: Constraint) -> None:
         if isinstance(constraint, LinearConstraint):
             self._linear_constraints.append(constraint)
-            f_row = _to_numpy_flat(constraint.f)
-            c_val = float(constraint.c)
-            if self._linear_F is None:
-                self._linear_F = f_row.reshape(1, -1)
-                self._linear_c = np.array([c_val])
-            else:
-                self._linear_F = np.vstack([self._linear_F, f_row.reshape(1, -1)])
-                self._linear_c = np.append(self._linear_c, c_val)
+            self._linear_F_rows.append(_to_numpy_flat(constraint.f))
+            self._linear_c_vals.append(float(constraint.c))
+            self._linear_index_dirty = True
         else:
             self._nonlinear_constraints.append(constraint)
+
+    def _rebuild_linear_index(self) -> None:
+        if not self._linear_index_dirty:
+            return
+        if self._linear_F_rows:
+            self._linear_F = np.array(self._linear_F_rows)
+            self._linear_c = np.array(self._linear_c_vals)
+        else:
+            self._linear_F = None
+            self._linear_c = None
+        self._linear_index_dirty = False
 
     def add_product_constraint(self, *, parameters: list[list[Array]] | list[dict[str,Array]], sparse: bool = True, compiled: bool = True) -> None:
         """
@@ -554,12 +608,13 @@ class TMGSampler:
         Notes
         -----
         This method handles refines hit times to improve accuracy and manages ghost hits.
-        As a fallback, if constraints are violated after propagation, the iteration is 
+        As a fallback, if constraints are violated after propagation, the iteration is
         redone with a new momentum. However this is extremely rare.
         """
-        t = 0 
+        t = 0
         i = 0
         x_init = x
+
         hs, cs = self._hit_times(x, xdot)
         h, c = hs[0], cs[0]
         while h < self.T - t:
@@ -580,17 +635,19 @@ class TMGSampler:
                     t += h
                     break
                 else:
-                    # Found ghost hit, continue to next hit time
                     continue
             else:
-                # No hit times found before max integration time, so break out of while loop
                 break
+
             hs, cs = self._hit_times(x, xdot)
             h, c = hs[0], cs[0]
+
         x, xdot = self._propagate(x, xdot, self.T - t)
         if verbose:
             print(f"\tNumber of collision checks: {i}")
-        if self._constraints_satisfied(x):
+
+        satisfied = self._constraints_satisfied(x)
+        if satisfied:
             return x
         self.constraint_violations += 1
         if verbose:
@@ -635,6 +692,7 @@ class TMGSampler:
         ValueError
             If cont is False and x0 is not provided, or if x0 does not satisfy constraints.
         """
+        self._rebuild_linear_index()
         if (not cont) and (x0 is not None):
             x0 = x0.reshape(self.dim, 1)
             if self.gpu:
@@ -676,7 +734,8 @@ class TMGSampler:
         Saves the sampler state to a pickled file.
         """
         d = self.__dict__.copy()
-        for key in ('_linear_constraints', '_nonlinear_constraints', '_linear_F', '_linear_c'):
+        for key in ('_linear_constraints', '_nonlinear_constraints', '_linear_F', '_linear_c',
+                    '_linear_F_rows', '_linear_c_vals', '_linear_index_dirty'):
             d.pop(key, None)
         d['constraints'] = [c.serialize() for c in d['constraints']]
         if self.gpu:

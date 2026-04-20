@@ -201,6 +201,65 @@ def test_save_load():
             assert np.allclose(c1.b, c2.b)
     os.remove("test_sampler.pkl")
 
+def test_add_linear_constraints_batch():
+    dim = 5
+    mu = np.random.randn(dim)
+    Sigma = np.eye(dim) + 0.1 * np.random.randn(dim, dim)
+    Sigma = Sigma @ Sigma.T
+
+    fs = np.random.randn(10, dim)
+    cs = np.random.randn(10)
+
+    sampler_batch = TMGSampler(mu=mu, Sigma=Sigma)
+    sampler_batch.add_linear_constraints(fs=fs, cs=cs)
+
+    sampler_individual = TMGSampler(mu=mu, Sigma=Sigma)
+    for i in range(10):
+        sampler_individual.add_constraint(f=fs[i].reshape(-1, 1), c=cs[i])
+
+    assert len(sampler_batch.constraints) == len(sampler_individual.constraints)
+    assert len(sampler_batch.constraints) == 10
+
+    for c1, c2 in zip(sampler_batch.constraints, sampler_individual.constraints):
+        assert isinstance(c1, LinearConstraint)
+        assert isinstance(c2, LinearConstraint)
+        assert np.allclose(c1.f, c2.f)
+        assert np.isclose(c1.c, c2.c)
+
+    sampler_batch._rebuild_linear_index()
+    sampler_individual._rebuild_linear_index()
+    assert sampler_batch._linear_F is not None
+    assert np.allclose(sampler_batch._linear_F, sampler_individual._linear_F)
+    assert np.allclose(sampler_batch._linear_c, sampler_individual._linear_c)
+
+
+def test_add_linear_constraints_batch_mixed_with_individual():
+    dim = 3
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    sampler.add_constraint(f=np.array([[1.0], [0.0], [0.0]]))
+
+    fs = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    cs = np.array([0.5, 0.5])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    assert len(sampler.constraints) == 3
+    sampler._rebuild_linear_index()
+    assert sampler._linear_F.shape == (3, dim)
+
+
+def test_add_linear_constraints_batch_sampling():
+    sampler = TMGSampler(Sigma=np.eye(2))
+    fs = np.array([[1.1, -1.0], [-1.0, 1.0]])
+    cs = np.array([0.0, 0.0])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    x0 = np.array([[1.0], [1.05]])
+    samples = sampler.sample(x0=x0, n_samples=100, burn_in=10)
+    satisfied = samples[:, 1] <= 1.1 * samples[:, 0]
+    satisfied &= samples[:, 1] >= samples[:, 0]
+    assert np.all(satisfied)
+
+
 def test_tight_constraints_end_to_end():
     sampler = TMGSampler(Sigma=np.eye(2))
     # x2 <= 1.1 x1 => x2 - 1.1 x1 >= 0
