@@ -9,6 +9,11 @@ from tmg_hmc import get_torch, get_tensor_type
 
 torch, Tensor = get_torch(), get_tensor_type()
 
+def _to_numpy_flat(x: Array) -> np.ndarray:
+    if isinstance(x, Tensor):
+        return x.detach().cpu().numpy().flatten()
+    return np.asarray(x).flatten()
+
 class TMGSampler:
     """
     Hamiltonian Monte Carlo sampler for Multivariate Gaussian distributions
@@ -260,7 +265,7 @@ class TMGSampler:
     def _index_constraint(self, constraint: Constraint) -> None:
         if isinstance(constraint, LinearConstraint):
             self._linear_constraints.append(constraint)
-            f_row = np.asarray(constraint.f).flatten()
+            f_row = _to_numpy_flat(constraint.f)
             c_val = float(constraint.c)
             if self._linear_F is None:
                 self._linear_F = f_row.reshape(1, -1)
@@ -346,7 +351,7 @@ class TMGSampler:
         if len(self.constraints) == 0:
             return True
         if self._linear_F is not None:
-            x_flat = np.asarray(x).flatten()
+            x_flat = _to_numpy_flat(x)
             vals = self._linear_F @ x_flat + self._linear_c
             if not np.all(vals >= 0):
                 return False
@@ -381,8 +386,8 @@ class TMGSampler:
     def _hit_times_linear(self, x: Array, xdot: Array) -> Tuple[Array, list]:
         F = self._linear_F
         c_vec = self._linear_c
-        x_flat = np.asarray(x).flatten()
-        xdot_flat = np.asarray(xdot).flatten()
+        x_flat = _to_numpy_flat(x)
+        xdot_flat = _to_numpy_flat(xdot)
 
         q1 = F @ xdot_flat
         q2 = F @ x_flat
