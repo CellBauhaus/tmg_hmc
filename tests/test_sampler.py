@@ -375,3 +375,115 @@ def test_tight_constraints_end_to_end():
     satisfied = samples[:,1] <= 1.1 * samples[:,0]
     satisfied &= samples[:,1] >= samples[:,0]
     assert np.all(satisfied)
+
+
+def test_vectorized_hit_times_match_scalar():
+    """Verify vectorized _hit_times_linear produces identical results to per-constraint hit_time."""
+    np.random.seed(99)
+    dim = 5
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    fs = np.random.randn(15, dim)
+    cs = np.random.randn(15)
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+    sampler._rebuild_linear_index()
+
+    for _ in range(20):
+        x = np.random.randn(dim, 1)
+        xdot = np.random.randn(dim, 1)
+
+        vec_times, vec_cs = sampler._hit_times_linear(x, xdot)
+
+        scalar_times = []
+        scalar_cs = []
+        for c in sampler._linear_constraints:
+            ht = c.hit_time(x, xdot)
+            valid = ht[~np.isnan(ht)]
+            scalar_times.extend(valid.tolist())
+            scalar_cs.extend([c] * len(valid))
+
+        vec_sorted = np.sort(vec_times)
+        scalar_sorted = np.sort(scalar_times)
+        assert len(vec_sorted) == len(scalar_sorted), (
+            f"Length mismatch: vectorized={len(vec_sorted)}, scalar={len(scalar_sorted)}"
+        )
+        assert np.allclose(vec_sorted, scalar_sorted), (
+            f"Times differ: max delta={np.max(np.abs(vec_sorted - scalar_sorted))}"
+        )
+
+        for t in vec_times:
+            vec_constraint = vec_cs[np.where(vec_times == t)[0][0]]
+            scalar_idx = scalar_times.index(t) if t in scalar_times else None
+            if scalar_idx is not None:
+                assert vec_constraint is scalar_cs[scalar_idx]
+
+
+def test_distribution_half_space_truncation():
+    """Verify sampling distribution matches known analytical moments for half-space truncation."""
+    np.random.seed(42)
+    dim = 2
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    sampler.add_constraint(f=np.array([[1.0], [0.0]]), c=0.0)
+    sampler.add_constraint(f=np.array([[0.0], [1.0]]), c=0.0)
+
+    x0 = np.array([[0.5], [0.5]])
+    samples = sampler.sample(x0=x0, n_samples=5000, burn_in=200)
+
+    expected_mean = np.sqrt(2 / np.pi)
+    assert abs(samples[:, 0].mean() - expected_mean) < 0.06
+    assert abs(samples[:, 1].mean() - expected_mean) < 0.06
+
+    expected_var = 1.0 - 2.0 / np.pi
+    assert abs(samples[:, 0].var() - expected_var) < 0.06
+    assert abs(samples[:, 1].var() - expected_var) < 0.06
+
+
+def test_distribution_correlated_half_space():
+    """Verify conditional mean with correlated Gaussian and half-space truncation."""
+    np.random.seed(42)
+    rho = 0.5
+    Sigma = np.array([[1.0, rho], [rho, 1.0]])
+    sampler = TMGSampler(Sigma=Sigma)
+    sampler.add_constraint(f=np.array([[1.0], [0.0]]), c=0.0)
+
+    x0 = np.array([[0.5], [0.0]])
+    samples = sampler.sample(x0=x0, n_samples=5000, burn_in=200)
+
+    expected_mean_x1 = np.sqrt(2 / np.pi)
+    expected_mean_x2 = rho * np.sqrt(2 / np.pi)
+    assert abs(samples[:, 0].mean() - expected_mean_x1) < 0.06
+    assert abs(samples[:, 1].mean() - expected_mean_x2) < 0.06
+
+
+def test_distribution_quadratic_ball_constraint():
+    """Verify ball constraint ||x|| <= r produces symmetric samples inside the ball."""
+    np.random.seed(42)
+    dim = 3
+    r = 2.0
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    sampler.add_constraint(A=-np.eye(dim), c=r**2)
+
+    x0 = np.zeros((dim, 1))
+    samples = sampler.sample(x0=x0, n_samples=3000, burn_in=200)
+
+    norms = np.sqrt(np.sum(samples**2, axis=1))
+    assert np.all(norms <= r + 1e-8)
+    for d in range(dim):
+        assert abs(samples[:, d].mean()) < 0.1
+
+
+def test_distribution_mixed_linear_and_quadratic():
+    """Verify sampling with both linear and quadratic constraints simultaneously."""
+    np.random.seed(42)
+    dim = 2
+    r = 2.0
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    sampler.add_constraint(A=-np.eye(dim), c=r**2)
+    sampler.add_constraint(f=np.array([[1.0], [0.0]]), c=0.0)
+
+    x0 = np.array([[0.5], [0.0]])
+    samples = sampler.sample(x0=x0, n_samples=3000, burn_in=200)
+
+    norms = np.sqrt(np.sum(samples**2, axis=1))
+    assert np.all(norms <= r + 1e-8)
+    assert np.all(samples[:, 0] >= -1e-8)
+    assert samples[:, 0].mean() > 0.3
