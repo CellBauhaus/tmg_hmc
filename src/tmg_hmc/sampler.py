@@ -408,6 +408,7 @@ class TMGSampler:
         """
         if len(self.constraints) == 0:
             return True
+        self._rebuild_linear_index()
         if self._linear_F is not None:
             x_flat = _to_numpy_flat(x)
             vals = self._linear_F @ x_flat + self._linear_c
@@ -501,6 +502,7 @@ class TMGSampler:
         """
         if len(self.constraints) == 0:
             return np.array([np.nan]), np.array([None])
+        self._rebuild_linear_index()
 
         times = []
         cs = []
