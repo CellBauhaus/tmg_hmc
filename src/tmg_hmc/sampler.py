@@ -455,7 +455,7 @@ class TMGSampler:
             q2 = F @ x_flat
         u = np.sqrt(q1**2 + q2**2)
 
-        valid = (u >= np.abs(c_vec)) & (u > 0) & (q2 != 0)
+        valid = (u >= np.abs(c_vec)) & (u > 0)
         if not np.any(valid):
             return np.array([]), []
 
@@ -466,7 +466,7 @@ class TMGSampler:
         valid_indices = np.where(valid)[0]
 
         arccos_term = np.arccos(-c_v / u_v)
-        arctan_term = np.arctan(q1_v / q2_v)
+        arctan_term = np.arctan2(q1_v, q2_v)
 
         offsets = pis.reshape(1, -1)
         s1 = (-arccos_term.reshape(-1, 1) + arctan_term.reshape(-1, 1) + offsets)

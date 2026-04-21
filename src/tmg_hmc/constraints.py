@@ -325,8 +325,8 @@ class LinearConstraint(Constraint):
         -----
         Hit time is computed by solving Eqn 2.26 in Pakman and Paninski (2014)
         See resources/HMC_exact_soln.nb for derivation
-        Due to the sum of inverse trig functions, we check the solution and 
-        the solution +- pi to ensure we capture all hit times. 
+        Due to the periodicity of the arccos term, we check the solution
+        shifted by {-pi, 0, +pi} to ensure we capture all hit times.
 
         Only positive hit times are returned and any ghost solutions are filtered 
         out at a later stage.
@@ -334,11 +334,10 @@ class LinearConstraint(Constraint):
         q1, q2 = self.compute_q(xdot, x)
         c = self.c
         u = np.sqrt(q1**2 + q2**2)
-        if (u < abs(c)) or (u == 0) or (q2 == 0): 
-            # No intersection so return NaN
+        if (u < abs(c)) or (u == 0):
             return np.array([np.nan])
-        s1 = -np.arccos(-c/u) + np.arctan(q1/q2) + pis
-        s2 = np.arccos(-c/u) + np.arctan(q1/q2) + pis
+        s1 = -np.arccos(-c/u) + np.arctan2(q1, q2) + pis
+        s2 = np.arccos(-c/u) + np.arctan2(q1, q2) + pis
         s = np.hstack([s1, s2])
         return s[s > eps]
 

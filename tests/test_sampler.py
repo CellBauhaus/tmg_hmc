@@ -377,6 +377,33 @@ def test_tight_constraints_end_to_end():
     assert np.all(satisfied)
 
 
+def test_hit_time_when_on_boundary():
+    """Verify hit times are found when particle starts exactly on a constraint boundary (q2=0)."""
+    dim = 2
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    f = np.array([[1.0], [0.0]])
+    sampler.add_constraint(f=f, c=0.0)
+    sampler._rebuild_linear_index()
+
+    x = np.array([[0.0], [1.0]])
+    xdot = np.array([[1.0], [0.0]])
+
+    constraint = sampler._linear_constraints[0]
+    times = constraint.hit_time(x, xdot)
+    valid_times = times[~np.isnan(times)]
+    assert len(valid_times) > 0, "Scalar hit_time should find solutions when q2=0"
+
+    vec_times, vec_cs = sampler._hit_times_linear(x, xdot)
+    assert len(vec_times) > 0, "Vectorized hit_times should find solutions when q2=0"
+
+    assert np.any(np.isclose(valid_times, np.pi, atol=1e-10)), (
+        f"Expected hit at t=pi (sin(pi)=0), got {valid_times}"
+    )
+    assert np.any(np.isclose(vec_times, np.pi, atol=1e-10)), (
+        f"Expected hit at t=pi in vectorized path, got {vec_times}"
+    )
+
+
 def test_vectorized_hit_times_match_scalar():
     """Verify vectorized _hit_times_linear produces identical results to per-constraint hit_time."""
     np.random.seed(99)
