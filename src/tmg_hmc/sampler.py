@@ -1,5 +1,6 @@
 from __future__ import annotations
 import numpy as np
+import time
 from typing import Tuple
 from tmg_hmc.constraints import Constraint, LinearConstraint, SimpleQuadraticConstraint, QuadraticConstraint, ProductConstraint, pis, eps
 from tmg_hmc.utils import Array, sparsify, is_nonzero_array
@@ -54,6 +55,7 @@ class TMGSampler:
         self.constraint_violations = 0
         self.gpu = gpu
         self.x = None
+        self._profile = None
         
         if Sigma_half is not None:
             self._setup_sigma_half(Sigma_half)
@@ -517,13 +519,19 @@ class TMGSampler:
         if len(times) == 0:
             return np.array([np.nan]), np.array([None])
 
+        if self._profile is not None:
+            t0 = time.perf_counter()
         times = np.hstack(times)
         nanind = np.isnan(times)
         times = times[~nanind]
         cs = np.array(cs)[~nanind]
         if len(times) == 0:
+            if self._profile is not None:
+                self._profile['filter_sort'] += time.perf_counter() - t0
             return np.array([np.nan]), np.array([None])
         inds = np.argsort(times)
+        if self._profile is not None:
+            self._profile['filter_sort'] += time.perf_counter() - t0
         return times[inds], cs[inds]
     
     def _binary_search(self, x: Array, xdot: Array, b1: float, b2: float, c: Constraint) -> Tuple[Array, Array, float, bool]:
@@ -591,6 +599,33 @@ class TMGSampler:
             return x, xdot, 0, False
         return self._binary_search(x, xdot, 0, h, c)
     
+    def enable_profiling(self) -> None:
+        self._profile = {
+            'hit_times': 0.0,
+            'propagate': 0.0,
+            'is_zero': 0.0,
+            'refine': 0.0,
+            'reflect': 0.0,
+            'filter_sort': 0.0,
+            'constraints_satisfied': 0.0,
+            'n_bounces': 0,
+            'n_ghost_hits': 0,
+            'n_hit_time_calls': 0,
+            'n_candidates_checked': 0,
+            'n_iters': 0,
+        }
+
+    def disable_profiling(self) -> None:
+        self._profile = None
+
+    def get_profile(self) -> dict | None:
+        if self._profile is None:
+            return None
+        p = self._profile.copy()
+        accounted = p['hit_times'] + p['propagate'] + p['is_zero'] + p['refine'] + p['reflect'] + p['constraints_satisfied']
+        p['accounted'] = accounted
+        return p
+
     def _iterate(self, x: Array, xdot: Array, verbose: bool = False) -> Array:
         """
         Performs a single iteration of the HMC sampler, propagating the state (x, xdot)
@@ -612,21 +647,28 @@ class TMGSampler:
 
         Notes
         -----
-        This method handles refines hit times to improve accuracy and manages ghost hits.
+        This method refines hit times to improve accuracy and manages ghost hits.
         As a fallback, if constraints are violated after propagation, the iteration is
         redone with a new momentum. However this is extremely rare.
         """
+        profiling = self._profile is not None
         t = 0
         i = 0
         x_init = x
         F = self._linear_F
 
+        if profiling:
+            t0 = time.perf_counter()
         if F is not None:
             _q1 = F @ _to_numpy_flat(xdot)
             _q2 = F @ _to_numpy_flat(x)
         else:
             _q1 = _q2 = None
         hs, cs = self._hit_times(x, xdot, _q1=_q1, _q2=_q2)
+        if profiling:
+            self._profile['hit_times'] += time.perf_counter() - t0
+            self._profile['n_hit_time_calls'] += 1
+
         h, c = hs[0], cs[0]
         while h < self.T - t:
             i += 1
@@ -635,34 +677,71 @@ class TMGSampler:
             cs = cs[inds]
             for pos in range(len(hs)):
                 h, c = hs[pos], cs[pos]
+                if profiling:
+                    self._profile['n_candidates_checked'] += 1
+                    t0 = time.perf_counter()
                 x_temp, xdot_temp = self._propagate(x, xdot, h)
+                if profiling:
+                    self._profile['propagate'] += time.perf_counter() - t0
+                    t0 = time.perf_counter()
                 zero, refine = c.is_zero(x_temp)
+                if profiling:
+                    self._profile['is_zero'] += time.perf_counter() - t0
                 if refine and (not zero):
+                    if profiling:
+                        t0 = time.perf_counter()
                     x_temp, xdot_temp, h_adj, zero = self._refine_hit_time(x_temp, xdot_temp, c)
+                    if profiling:
+                        self._profile['refine'] += time.perf_counter() - t0
                     h += h_adj
                 if zero:
                     x, xdot = x_temp, xdot_temp
+                    if profiling:
+                        t0 = time.perf_counter()
                     xdot = c.reflect(x, xdot)
+                    if profiling:
+                        self._profile['reflect'] += time.perf_counter() - t0
+                        self._profile['n_bounces'] += 1
                     t += h
                     break
                 else:
+                    if profiling:
+                        self._profile['n_ghost_hits'] += 1
                     continue
             else:
+                # No hit times found before max integration time, so break out of while loop
                 break
 
+            if profiling:
+                t0 = time.perf_counter()
             if F is not None:
                 cos_h = np.cos(h)
                 sin_h = np.sin(h)
                 _q2 = cos_h * _q2 + sin_h * _q1
                 _q1 = F @ _to_numpy_flat(xdot)
             hs, cs = self._hit_times(x, xdot, _q1=_q1, _q2=_q2)
+            if profiling:
+                self._profile['hit_times'] += time.perf_counter() - t0
+                self._profile['n_hit_time_calls'] += 1
+
             h, c = hs[0], cs[0]
 
+        if profiling:
+            t0 = time.perf_counter()
         x, xdot = self._propagate(x, xdot, self.T - t)
+        if profiling:
+            self._profile['propagate'] += time.perf_counter() - t0
+
         if verbose:
             print(f"\tNumber of collision checks: {i}")
 
+        if profiling:
+            t0 = time.perf_counter()
         satisfied = self._constraints_satisfied(x)
+        if profiling:
+            self._profile['constraints_satisfied'] += time.perf_counter() - t0
+            self._profile['n_iters'] += 1
+
         if satisfied:
             return x
         self.constraint_violations += 1
