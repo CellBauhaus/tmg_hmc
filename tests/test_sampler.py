@@ -6,6 +6,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from tmg_hmc import TMGSampler, _TORCH_AVAILABLE
+from tmg_hmc.sampler import _to_numpy_flat
 from tmg_hmc.constraints import LinearConstraint, SimpleQuadraticConstraint, QuadraticConstraint, ProductConstraint
 if _TORCH_AVAILABLE:
     import torch
@@ -375,6 +376,63 @@ def test_tight_constraints_end_to_end():
     satisfied = samples[:,1] <= 1.1 * samples[:,0]
     satisfied &= samples[:,1] >= samples[:,0]
     assert np.all(satisfied)
+
+
+def test_q_value_correctness_through_bounce():
+    """Verify cached q-values match fresh computation after a bounce with reflection."""
+    np.random.seed(7)
+    dim = 4
+    sampler = TMGSampler(Sigma=np.eye(dim))
+
+    fs = np.random.randn(8, dim)
+    cs = np.zeros(8)
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+    sampler._rebuild_linear_index()
+    F = sampler._linear_F
+
+    bounces_tested = 0
+    for trial in range(50):
+        x = np.random.randn(dim, 1) * 0.1
+        xdot = np.random.randn(dim, 1)
+
+        _q1 = F @ _to_numpy_flat(xdot)
+        _q2 = F @ _to_numpy_flat(x)
+
+        hs, cs_out = sampler._hit_times(x, xdot, _q1=_q1, _q2=_q2)
+        if np.isnan(hs[0]):
+            continue
+
+        h = hs[0]
+        c = cs_out[0]
+
+        x_hit, xdot_hit = sampler._propagate(x, xdot, h)
+        zero, _ = c.is_zero(x_hit)
+        if not zero:
+            continue
+
+        xdot_reflected = c.reflect(x_hit, xdot_hit)
+
+        # Incremental update (what _iterate does):
+        cos_h = np.cos(h)
+        sin_h = np.sin(h)
+        q2_incremental = cos_h * _q2 + sin_h * _q1
+        q1_incremental = F @ _to_numpy_flat(xdot_reflected)
+
+        # Fresh computation from post-bounce state:
+        q2_fresh = F @ _to_numpy_flat(x_hit)
+        q1_fresh = F @ _to_numpy_flat(xdot_reflected)
+
+        assert np.allclose(q2_incremental, q2_fresh, atol=1e-10), (
+            f"q2 mismatch after bounce on trial {trial}: "
+            f"max diff={np.max(np.abs(q2_incremental - q2_fresh))}"
+        )
+        assert np.allclose(q1_incremental, q1_fresh, atol=1e-10), (
+            f"q1 mismatch after bounce on trial {trial}: "
+            f"max diff={np.max(np.abs(q1_incremental - q1_fresh))}"
+        )
+        bounces_tested += 1
+
+    assert bounces_tested >= 5, f"Only tested {bounces_tested} bounces, need at least 5"
 
 
 def test_hit_time_when_on_boundary():
