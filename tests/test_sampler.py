@@ -6,6 +6,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from tmg_hmc import TMGSampler, _TORCH_AVAILABLE
+from tmg_hmc.sampler import _to_numpy_flat
 from tmg_hmc.constraints import LinearConstraint, SimpleQuadraticConstraint, QuadraticConstraint, ProductConstraint
 if _TORCH_AVAILABLE:
     import torch
@@ -201,6 +202,166 @@ def test_save_load():
             assert np.allclose(c1.b, c2.b)
     os.remove("test_sampler.pkl")
 
+def test_add_linear_constraints_batch():
+    dim = 5
+    mu = np.random.randn(dim)
+    Sigma = np.eye(dim) + 0.1 * np.random.randn(dim, dim)
+    Sigma = Sigma @ Sigma.T
+
+    fs = np.random.randn(10, dim)
+    cs = np.random.randn(10)
+
+    sampler_batch = TMGSampler(mu=mu, Sigma=Sigma)
+    sampler_batch.add_linear_constraints(fs=fs, cs=cs)
+
+    sampler_individual = TMGSampler(mu=mu, Sigma=Sigma)
+    for i in range(10):
+        sampler_individual.add_constraint(f=fs[i].reshape(-1, 1), c=cs[i])
+
+    assert len(sampler_batch.constraints) == len(sampler_individual.constraints)
+    assert len(sampler_batch.constraints) == 10
+
+    for c1, c2 in zip(sampler_batch.constraints, sampler_individual.constraints):
+        assert isinstance(c1, LinearConstraint)
+        assert isinstance(c2, LinearConstraint)
+        assert np.allclose(c1.f, c2.f)
+        assert np.isclose(c1.c, c2.c)
+
+    sampler_batch._rebuild_linear_index()
+    sampler_individual._rebuild_linear_index()
+    assert sampler_batch._linear_F is not None
+    assert np.allclose(sampler_batch._linear_F, sampler_individual._linear_F)
+    assert np.allclose(sampler_batch._linear_c, sampler_individual._linear_c)
+
+
+def test_add_linear_constraints_batch_mixed_with_individual():
+    dim = 3
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    sampler.add_constraint(f=np.array([[1.0], [0.0], [0.0]]))
+
+    fs = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    cs = np.array([0.5, 0.5])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    assert len(sampler.constraints) == 3
+    sampler._rebuild_linear_index()
+    assert sampler._linear_F.shape == (3, dim)
+
+
+def test_add_linear_constraints_batch_sampling():
+    sampler = TMGSampler(Sigma=np.eye(2))
+    fs = np.array([[1.1, -1.0], [-1.0, 1.0]])
+    cs = np.array([0.0, 0.0])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    x0 = np.array([[1.0], [1.05]])
+    samples = sampler.sample(x0=x0, n_samples=100, burn_in=10)
+    satisfied = samples[:, 1] <= 1.1 * samples[:, 0]
+    satisfied &= samples[:, 1] >= samples[:, 0]
+    assert np.all(satisfied)
+
+
+def test_hit_times_with_precomputed_q_values():
+    dim = 5
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    fs = np.random.randn(20, dim)
+    cs = np.zeros(20)
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+    sampler._rebuild_linear_index()
+
+    x = np.random.randn(dim, 1)
+    xdot = np.random.randn(dim, 1)
+
+    hs_baseline, cs_baseline = sampler._hit_times(x, xdot)
+
+    F = sampler._linear_F
+    q1 = F @ xdot.flatten()
+    q2 = F @ x.flatten()
+    hs_cached, cs_cached = sampler._hit_times(x, xdot, _q1=q1, _q2=q2)
+
+    assert np.allclose(hs_baseline, hs_cached)
+    assert len(cs_baseline) == len(cs_cached)
+    for c1, c2 in zip(cs_baseline, cs_cached):
+        if c1 is None:
+            assert c2 is None
+        else:
+            assert c1 is c2
+
+
+def test_q_value_propagation_identity():
+    dim = 5
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    fs = np.random.randn(20, dim)
+    cs = np.zeros(20)
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+    sampler._rebuild_linear_index()
+
+    F = sampler._linear_F
+    x = np.random.randn(dim, 1)
+    xdot = np.random.randn(dim, 1)
+
+    q1 = F @ xdot.flatten()
+    q2 = F @ x.flatten()
+
+    h = 0.7
+    x_new, xdot_new = sampler._propagate(x, xdot, h)
+
+    q2_direct = F @ x_new.flatten()
+    q1_direct = F @ xdot_new.flatten()
+
+    q2_cached = np.cos(h) * q2 + np.sin(h) * q1
+    q1_cached = np.cos(h) * q1 - np.sin(h) * q2
+
+    assert np.allclose(q2_direct, q2_cached)
+    assert np.allclose(q1_direct, q1_cached)
+
+
+def test_q_value_caching_sampling_correctness():
+    sampler = TMGSampler(Sigma=np.eye(3))
+    fs = np.array([[1.0, -1.0, 0.0],
+                   [-1.0, 1.0, 0.0],
+                   [0.0, 1.0, -1.0],
+                   [0.0, -1.0, 1.0]])
+    cs = np.array([0.5, 0.5, 0.5, 0.5])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    x0 = np.array([[0.0], [0.0], [0.0]])
+    samples = sampler.sample(x0=x0, n_samples=200, burn_in=20)
+
+    for i in range(len(fs)):
+        vals = samples @ fs[i] + cs[i]
+        assert np.all(vals >= -1e-10), f"Constraint {i} violated"
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not gpu_available, reason="GPU not available")
+def test_add_linear_constraints_batch_gpu_types():
+    dim = 3
+    sampler = TMGSampler(Sigma=np.eye(dim), gpu=True)
+    fs = np.array([[1.0, -1.0, 0.0], [0.0, 1.0, -1.0]])
+    cs = np.array([0.0, 0.0])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    for c in sampler._linear_constraints:
+        assert isinstance(c.f, torch.Tensor), "Batch-added constraint f should be a CUDA tensor in GPU mode"
+        assert c.f.is_cuda, "Batch-added constraint f should be on CUDA"
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not gpu_available, reason="GPU not available")
+def test_add_linear_constraints_batch_gpu_sampling():
+    sampler = TMGSampler(Sigma=np.eye(2), gpu=True)
+    fs = np.array([[1.1, -1.0], [-1.0, 1.0]])
+    cs = np.array([0.0, 0.0])
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+
+    x0 = np.array([[1.0], [1.05]])
+    samples = sampler.sample(x0=x0, n_samples=50, burn_in=10)
+    satisfied = samples[:, 1] <= 1.1 * samples[:, 0]
+    satisfied &= samples[:, 1] >= samples[:, 0]
+    assert np.all(satisfied)
+
+
 def test_tight_constraints_end_to_end():
     sampler = TMGSampler(Sigma=np.eye(2))
     # x2 <= 1.1 x1 => x2 - 1.1 x1 >= 0
@@ -215,3 +376,199 @@ def test_tight_constraints_end_to_end():
     satisfied = samples[:,1] <= 1.1 * samples[:,0]
     satisfied &= samples[:,1] >= samples[:,0]
     assert np.all(satisfied)
+
+
+def test_q_value_correctness_through_bounce():
+    """Verify cached q-values match fresh computation after a bounce with reflection."""
+    np.random.seed(7)
+    dim = 4
+    sampler = TMGSampler(Sigma=np.eye(dim))
+
+    fs = np.random.randn(8, dim)
+    cs = np.zeros(8)
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+    sampler._rebuild_linear_index()
+    F = sampler._linear_F
+
+    bounces_tested = 0
+    for trial in range(50):
+        x = np.random.randn(dim, 1) * 0.1
+        xdot = np.random.randn(dim, 1)
+
+        _q1 = F @ _to_numpy_flat(xdot)
+        _q2 = F @ _to_numpy_flat(x)
+
+        hs, cs_out = sampler._hit_times(x, xdot, _q1=_q1, _q2=_q2)
+        if np.isnan(hs[0]):
+            continue
+
+        h = hs[0]
+        c = cs_out[0]
+
+        x_hit, xdot_hit = sampler._propagate(x, xdot, h)
+        zero, _ = c.is_zero(x_hit)
+        if not zero:
+            continue
+
+        xdot_reflected = c.reflect(x_hit, xdot_hit)
+
+        # Incremental update (what _iterate does):
+        cos_h = np.cos(h)
+        sin_h = np.sin(h)
+        q2_incremental = cos_h * _q2 + sin_h * _q1
+        q1_incremental = F @ _to_numpy_flat(xdot_reflected)
+
+        # Fresh computation from post-bounce state:
+        q2_fresh = F @ _to_numpy_flat(x_hit)
+        q1_fresh = F @ _to_numpy_flat(xdot_reflected)
+
+        assert np.allclose(q2_incremental, q2_fresh, atol=1e-10), (
+            f"q2 mismatch after bounce on trial {trial}: "
+            f"max diff={np.max(np.abs(q2_incremental - q2_fresh))}"
+        )
+        assert np.allclose(q1_incremental, q1_fresh, atol=1e-10), (
+            f"q1 mismatch after bounce on trial {trial}: "
+            f"max diff={np.max(np.abs(q1_incremental - q1_fresh))}"
+        )
+        bounces_tested += 1
+
+    assert bounces_tested >= 5, f"Only tested {bounces_tested} bounces, need at least 5"
+
+
+def test_hit_time_when_on_boundary():
+    """Verify hit times are found when particle starts exactly on a constraint boundary (q2=0)."""
+    dim = 2
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    f = np.array([[1.0], [0.0]])
+    sampler.add_constraint(f=f, c=0.0)
+    sampler._rebuild_linear_index()
+
+    x = np.array([[0.0], [1.0]])
+    xdot = np.array([[1.0], [0.0]])
+
+    constraint = sampler._linear_constraints[0]
+    times = constraint.hit_time(x, xdot)
+    valid_times = times[~np.isnan(times)]
+    assert len(valid_times) > 0, "Scalar hit_time should find solutions when q2=0"
+
+    vec_times, vec_cs = sampler._hit_times_linear(x, xdot)
+    assert len(vec_times) > 0, "Vectorized hit_times should find solutions when q2=0"
+
+    assert np.any(np.isclose(valid_times, np.pi, atol=1e-10)), (
+        f"Expected hit at t=pi (sin(pi)=0), got {valid_times}"
+    )
+    assert np.any(np.isclose(vec_times, np.pi, atol=1e-10)), (
+        f"Expected hit at t=pi in vectorized path, got {vec_times}"
+    )
+
+
+def test_vectorized_hit_times_match_scalar():
+    """Verify vectorized _hit_times_linear produces identical results to per-constraint hit_time."""
+    np.random.seed(99)
+    dim = 5
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    fs = np.random.randn(15, dim)
+    cs = np.random.randn(15)
+    sampler.add_linear_constraints(fs=fs, cs=cs)
+    sampler._rebuild_linear_index()
+
+    for _ in range(20):
+        x = np.random.randn(dim, 1)
+        xdot = np.random.randn(dim, 1)
+
+        vec_times, vec_cs = sampler._hit_times_linear(x, xdot)
+
+        scalar_times = []
+        scalar_cs = []
+        for c in sampler._linear_constraints:
+            ht = c.hit_time(x, xdot)
+            valid = ht[~np.isnan(ht)]
+            scalar_times.extend(valid.tolist())
+            scalar_cs.extend([c] * len(valid))
+
+        vec_sorted = np.sort(vec_times)
+        scalar_sorted = np.sort(scalar_times)
+        assert len(vec_sorted) == len(scalar_sorted), (
+            f"Length mismatch: vectorized={len(vec_sorted)}, scalar={len(scalar_sorted)}"
+        )
+        assert np.allclose(vec_sorted, scalar_sorted), (
+            f"Times differ: max delta={np.max(np.abs(vec_sorted - scalar_sorted))}"
+        )
+
+        for t in vec_times:
+            vec_constraint = vec_cs[np.where(vec_times == t)[0][0]]
+            scalar_idx = scalar_times.index(t) if t in scalar_times else None
+            if scalar_idx is not None:
+                assert vec_constraint is scalar_cs[scalar_idx]
+
+
+def test_distribution_half_space_truncation():
+    """Verify sampling distribution matches known analytical moments for half-space truncation."""
+    np.random.seed(42)
+    dim = 2
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    sampler.add_constraint(f=np.array([[1.0], [0.0]]), c=0.0)
+    sampler.add_constraint(f=np.array([[0.0], [1.0]]), c=0.0)
+
+    x0 = np.array([[0.5], [0.5]])
+    samples = sampler.sample(x0=x0, n_samples=5000, burn_in=200)
+
+    expected_mean = np.sqrt(2 / np.pi)
+    assert abs(samples[:, 0].mean() - expected_mean) < 0.06
+    assert abs(samples[:, 1].mean() - expected_mean) < 0.06
+
+    expected_var = 1.0 - 2.0 / np.pi
+    assert abs(samples[:, 0].var() - expected_var) < 0.06
+    assert abs(samples[:, 1].var() - expected_var) < 0.06
+
+
+def test_distribution_correlated_half_space():
+    """Verify conditional mean with correlated Gaussian and half-space truncation."""
+    np.random.seed(42)
+    rho = 0.5
+    Sigma = np.array([[1.0, rho], [rho, 1.0]])
+    sampler = TMGSampler(Sigma=Sigma)
+    sampler.add_constraint(f=np.array([[1.0], [0.0]]), c=0.0)
+
+    x0 = np.array([[0.5], [0.0]])
+    samples = sampler.sample(x0=x0, n_samples=5000, burn_in=200)
+
+    expected_mean_x1 = np.sqrt(2 / np.pi)
+    expected_mean_x2 = rho * np.sqrt(2 / np.pi)
+    assert abs(samples[:, 0].mean() - expected_mean_x1) < 0.06
+    assert abs(samples[:, 1].mean() - expected_mean_x2) < 0.06
+
+
+def test_distribution_quadratic_ball_constraint():
+    """Verify ball constraint ||x|| <= r produces symmetric samples inside the ball."""
+    np.random.seed(42)
+    dim = 3
+    r = 2.0
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    sampler.add_constraint(A=-np.eye(dim), c=r**2)
+
+    x0 = np.zeros((dim, 1))
+    samples = sampler.sample(x0=x0, n_samples=3000, burn_in=200)
+
+    norms = np.sqrt(np.sum(samples**2, axis=1))
+    assert np.all(norms <= r + 1e-8)
+    for d in range(dim):
+        assert abs(samples[:, d].mean()) < 0.1
+
+
+def test_distribution_mixed_linear_and_quadratic():
+    """Verify sampling with both linear and quadratic constraints simultaneously."""
+    np.random.seed(42)
+    dim = 2
+    r = 2.0
+    sampler = TMGSampler(Sigma=np.eye(dim))
+    sampler.add_constraint(A=-np.eye(dim), c=r**2)
+    sampler.add_constraint(f=np.array([[1.0], [0.0]]), c=0.0)
+
+    x0 = np.array([[0.5], [0.0]])
+    samples = sampler.sample(x0=x0, n_samples=3000, burn_in=200)
+
+    norms = np.sqrt(np.sum(samples**2, axis=1))
+    assert np.all(norms <= r + 1e-8)
+    assert np.all(samples[:, 0] >= -1e-8)
+    assert samples[:, 0].mean() > 0.3
